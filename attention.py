@@ -1,159 +1,216 @@
 #!/usr/bin/env python3
-"""Attention mechanism — scaled dot-product and multi-head attention.
+"""Attention mechanisms — scaled dot-product, multi-head, causal, cross-attention.
 
-One file. Zero deps. Does one thing well.
+Pure Python implementation of the core transformer building blocks.
+No numpy/torch — just math and lists.
 
-The core of transformers: Q·K^T/√d_k softmax then ·V, with multi-head
-projection. Includes causal masking and positional encoding.
+Usage: python attention.py [--test]
 """
-import math, random, sys
+
+import sys, math, random
 
 def matmul(A, B):
-    """Matrix multiply: (m,n) x (n,p) -> (m,p)."""
-    m, n = len(A), len(A[0])
-    p = len(B[0])
-    return [[sum(A[i][k] * B[k][j] for k in range(n)) for j in range(p)] for i in range(m)]
+    """Matrix multiply A (m×n) @ B (n×p) → (m×p)."""
+    m, n, p = len(A), len(A[0]), len(B[0])
+    C = [[0.0]*p for _ in range(m)]
+    for i in range(m):
+        for j in range(p):
+            s = 0.0
+            for k in range(n):
+                s += A[i][k] * B[k][j]
+            C[i][j] = s
+    return C
 
 def transpose(A):
-    return [[A[j][i] for j in range(len(A))] for i in range(len(A[0]))]
+    m, n = len(A), len(A[0])
+    return [[A[i][j] for i in range(m)] for j in range(n)]
 
-def softmax(row):
-    mx = max(row)
-    exps = [math.exp(x - mx) for x in row]
+def softmax(x):
+    mx = max(x)
+    exps = [math.exp(v - mx) for v in x]
     s = sum(exps)
     return [e / s for e in exps]
 
+def softmax_2d(X):
+    return [softmax(row) for row in X]
+
 def scaled_dot_product_attention(Q, K, V, mask=None):
-    """
+    """Scaled dot-product attention: softmax(QK^T / sqrt(d_k)) V.
+    
     Q: (seq_q, d_k), K: (seq_k, d_k), V: (seq_k, d_v)
-    Returns: (seq_q, d_v), attention_weights
+    Returns: (seq_q, d_v), attention_weights (seq_q, seq_k)
     """
     d_k = len(Q[0])
     scale = math.sqrt(d_k)
-    # Q · K^T
+    
+    # QK^T
     KT = transpose(K)
     scores = matmul(Q, KT)
+    
     # Scale
-    scores = [[s / scale for s in row] for row in scores]
-    # Mask (causal or padding)
+    for i in range(len(scores)):
+        for j in range(len(scores[0])):
+            scores[i][j] /= scale
+    
+    # Apply mask (causal or padding)
     if mask is not None:
         for i in range(len(scores)):
             for j in range(len(scores[0])):
                 if not mask[i][j]:
                     scores[i][j] = -1e9
-    # Softmax per row
-    weights = [softmax(row) for row in scores]
-    # Weights · V
+    
+    # Softmax
+    weights = softmax_2d(scores)
+    
+    # Weighted sum of V
     output = matmul(weights, V)
     return output, weights
 
-def linear_project(X, W, b=None):
-    """X: (seq, d_in), W: (d_in, d_out) -> (seq, d_out)."""
+def linear_transform(X, W, b=None):
+    """Apply linear transform: XW + b."""
     result = matmul(X, W)
     if b:
-        result = [[result[i][j] + b[j] for j in range(len(b))] for i in range(len(result))]
+        for i in range(len(result)):
+            for j in range(len(result[0])):
+                result[i][j] += b[j]
     return result
+
+def split_heads(X, n_heads):
+    """Split last dim into n_heads: (seq, d) → list of n_heads × (seq, d/n_heads)."""
+    seq_len = len(X)
+    d = len(X[0])
+    head_dim = d // n_heads
+    heads = []
+    for h in range(n_heads):
+        head = [[X[s][h*head_dim + i] for i in range(head_dim)] for s in range(seq_len)]
+        heads.append(head)
+    return heads
+
+def concat_heads(heads):
+    """Concatenate heads: list of (seq, head_dim) → (seq, d)."""
+    seq_len = len(heads[0])
+    return [[v for head in heads for v in head[s]] for s in range(seq_len)]
+
+def multi_head_attention(Q, K, V, n_heads, W_q, W_k, W_v, W_o, mask=None):
+    """Multi-head attention.
+    
+    Q,K,V: (seq, d_model)
+    W_q,W_k,W_v: (d_model, d_model), W_o: (d_model, d_model)
+    """
+    Q_proj = linear_transform(Q, W_q)
+    K_proj = linear_transform(K, W_k)
+    V_proj = linear_transform(V, W_v)
+    
+    Q_heads = split_heads(Q_proj, n_heads)
+    K_heads = split_heads(K_proj, n_heads)
+    V_heads = split_heads(V_proj, n_heads)
+    
+    head_outputs = []
+    all_weights = []
+    for qh, kh, vh in zip(Q_heads, K_heads, V_heads):
+        out, weights = scaled_dot_product_attention(qh, kh, vh, mask)
+        head_outputs.append(out)
+        all_weights.append(weights)
+    
+    concat = concat_heads(head_outputs)
+    output = linear_transform(concat, W_o)
+    return output, all_weights
+
+def causal_mask(seq_len):
+    """Lower-triangular causal mask for autoregressive attention."""
+    return [[1 if j <= i else 0 for j in range(seq_len)] for i in range(seq_len)]
 
 def random_matrix(rows, cols, scale=0.1):
     return [[random.gauss(0, scale) for _ in range(cols)] for _ in range(rows)]
 
-class MultiHeadAttention:
-    def __init__(self, d_model, num_heads):
-        assert d_model % num_heads == 0
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.d_k = d_model // num_heads
-        # Projection matrices
-        self.W_q = random_matrix(d_model, d_model)
-        self.W_k = random_matrix(d_model, d_model)
-        self.W_v = random_matrix(d_model, d_model)
-        self.W_o = random_matrix(d_model, d_model)
+# --- Tests ---
 
-    def _split_heads(self, X):
-        """(seq, d_model) -> (num_heads, seq, d_k)."""
-        seq_len = len(X)
-        heads = []
-        for h in range(self.num_heads):
-            start = h * self.d_k
-            head = [[X[s][start + k] for k in range(self.d_k)] for s in range(seq_len)]
-            heads.append(head)
-        return heads
+def test_softmax():
+    s = softmax([1, 2, 3])
+    assert abs(sum(s) - 1.0) < 1e-9
+    assert s[2] > s[1] > s[0]
+    
+    # Numerical stability
+    s2 = softmax([1000, 1001, 1002])
+    assert abs(sum(s2) - 1.0) < 1e-9
 
-    def _merge_heads(self, heads):
-        """(num_heads, seq, d_k) -> (seq, d_model)."""
-        seq_len = len(heads[0])
-        merged = []
-        for s in range(seq_len):
-            row = []
-            for h in heads:
-                row.extend(h[s])
-            merged.append(row)
-        return merged
+def test_matmul():
+    A = [[1, 2], [3, 4]]
+    B = [[5, 6], [7, 8]]
+    C = matmul(A, B)
+    assert C == [[19, 22], [43, 50]]
 
-    def forward(self, X, causal=False):
-        Q = linear_project(X, self.W_q)
-        K = linear_project(X, self.W_k)
-        V = linear_project(X, self.W_v)
-        Q_heads = self._split_heads(Q)
-        K_heads = self._split_heads(K)
-        V_heads = self._split_heads(V)
-        # Causal mask
-        mask = None
-        if causal:
-            seq = len(X)
-            mask = [[1 if j <= i else 0 for j in range(seq)] for i in range(seq)]
-        attn_heads = []
-        all_weights = []
-        for qh, kh, vh in zip(Q_heads, K_heads, V_heads):
-            out, w = scaled_dot_product_attention(qh, kh, vh, mask)
-            attn_heads.append(out)
-            all_weights.append(w)
-        merged = self._merge_heads(attn_heads)
-        output = linear_project(merged, self.W_o)
-        return output, all_weights
-
-def positional_encoding(seq_len, d_model):
-    pe = []
-    for pos in range(seq_len):
-        row = []
-        for i in range(d_model):
-            if i % 2 == 0:
-                row.append(math.sin(pos / (10000 ** (i / d_model))))
-            else:
-                row.append(math.cos(pos / (10000 ** ((i - 1) / d_model))))
-        pe.append(row)
-    return pe
-
-def main():
+def test_scaled_attention():
     random.seed(42)
-    print("=== Attention Mechanism ===\n")
-
-    # Simple attention
-    seq_len, d_model = 4, 8
-    X = random_matrix(seq_len, d_model)
-    Q = K = V = X
+    seq_len, d = 4, 8
+    Q = random_matrix(seq_len, d)
+    K = random_matrix(seq_len, d)
+    V = random_matrix(seq_len, d)
+    
     out, weights = scaled_dot_product_attention(Q, K, V)
-    print(f"Self-attention: input ({seq_len}, {d_model}) → output ({len(out)}, {len(out[0])})")
-    print(f"Attention weights (row sums ≈ 1.0): {[f'{sum(w):.3f}' for w in weights]}")
+    assert len(out) == seq_len
+    assert len(out[0]) == d
+    # Weights should sum to 1 per row
+    for row in weights:
+        assert abs(sum(row) - 1.0) < 1e-6
 
-    # Causal attention
-    mask = [[1 if j <= i else 0 for j in range(seq_len)] for i in range(seq_len)]
-    out_c, weights_c = scaled_dot_product_attention(Q, K, V, mask)
-    print(f"\nCausal mask pattern:")
-    for row in mask:
-        print(f"  {''.join('█' if x else '░' for x in row)}")
+def test_causal_attention():
+    random.seed(42)
+    seq_len, d = 4, 8
+    Q = random_matrix(seq_len, d)
+    K = random_matrix(seq_len, d)
+    V = random_matrix(seq_len, d)
+    mask = causal_mask(seq_len)
+    
+    _, weights = scaled_dot_product_attention(Q, K, V, mask)
+    # Position 0 should only attend to itself
+    assert weights[0][0] > 0.99
+    # Position 1 attends to 0 and 1 only
+    assert abs(weights[1][2]) < 1e-6
+    assert abs(weights[1][3]) < 1e-6
 
-    # Multi-head attention
-    print(f"\nMulti-Head Attention (d_model={d_model}, heads=2):")
-    mha = MultiHeadAttention(d_model, num_heads=2)
-    out_mha, head_weights = mha.forward(X, causal=True)
-    print(f"  Output shape: ({len(out_mha)}, {len(out_mha[0])})")
-    print(f"  Heads: {len(head_weights)}, each with {len(head_weights[0])}x{len(head_weights[0][0])} weights")
+def test_multi_head():
+    random.seed(42)
+    seq_len, d_model, n_heads = 3, 8, 2
+    X = random_matrix(seq_len, d_model)
+    W_q = random_matrix(d_model, d_model)
+    W_k = random_matrix(d_model, d_model)
+    W_v = random_matrix(d_model, d_model)
+    W_o = random_matrix(d_model, d_model)
+    
+    out, weights = multi_head_attention(X, X, X, n_heads, W_q, W_k, W_v, W_o)
+    assert len(out) == seq_len
+    assert len(out[0]) == d_model
+    assert len(weights) == n_heads
 
-    # Positional encoding
-    pe = positional_encoding(seq_len, d_model)
-    X_pe = [[X[i][j] + pe[i][j] for j in range(d_model)] for i in range(seq_len)]
-    print(f"\nWith positional encoding: input[0][:4] = {[f'{x:.3f}' for x in X_pe[0][:4]]}")
+def test_cross_attention():
+    random.seed(42)
+    q_len, kv_len, d = 3, 5, 8
+    Q = random_matrix(q_len, d)
+    K = random_matrix(kv_len, d)
+    V = random_matrix(kv_len, d)
+    
+    out, weights = scaled_dot_product_attention(Q, K, V)
+    assert len(out) == q_len
+    assert len(weights) == q_len
+    assert len(weights[0]) == kv_len
+
+def test_split_concat():
+    X = [[1,2,3,4], [5,6,7,8]]
+    heads = split_heads(X, 2)
+    assert len(heads) == 2
+    assert heads[0] == [[1,2],[5,6]]
+    assert heads[1] == [[3,4],[7,8]]
+    merged = concat_heads(heads)
+    assert merged == X
 
 if __name__ == "__main__":
-    main()
+    if "--test" in sys.argv or len(sys.argv) == 1:
+        test_softmax()
+        test_matmul()
+        test_scaled_attention()
+        test_causal_attention()
+        test_multi_head()
+        test_cross_attention()
+        test_split_concat()
+        print("All tests passed!")
